@@ -1,3 +1,4 @@
+# services/api/rag/llm_utils.py
 import logging
 from typing import Any, List, Tuple, Dict
 
@@ -19,33 +20,36 @@ except ImportError:
 # --- Initializations ---
 retriever = None
 llm_chain = None
+answer_chain = None
 
-if LANGCHAIN_AVAILABLE and config.GOOGLE_API_KEY:
+# --- THIS IS THE FIX ---
+# Add explicit checks and logging for dependencies and configuration.
+if not config.GOOGLE_API_KEY:
+    logger.warning("GOOGLE_API_KEY environment variable is not set. LLM features will be disabled.")
+elif not LANGCHAIN_AVAILABLE:
+    logger.warning("Langchain dependencies are not installed. LLM features will be disabled.")
+else:
+    # Vector DB Initialization
     try:
-        # --- THIS BLOCK IS CORRECTED ---
-        # Vector DB (Chroma)
-        # Explicitly pass host and port to the client.
         chroma_client = chromadb.HttpClient(host=config.CHROMA_HOST, port=config.CHROMA_PORT)
-        chroma_client.heartbeat() # Check connection
-        
+        chroma_client.heartbeat()
         embedding_function = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=config.GOOGLE_API_KEY)
-        
-        # Pass the initialized client to the Chroma vector store.
         vector_store = Chroma(
             client=chroma_client,
             collection_name=config.CHROMA_COLLECTION,
             embedding_function=embedding_function
         )
         retriever = vector_store.as_retriever(search_kwargs={"k": 1})
-        logger.info("Connected to Chroma collection '%s' at %s:%s", config.CHROMA_COLLECTION, config.CHROMA_HOST, config.CHROMA_PORT)
-
+        logger.info("Successfully connected to Chroma collection '%s' at %s:%s", config.CHROMA_COLLECTION, config.CHROMA_HOST, config.CHROMA_PORT)
     except Exception as e:
         logger.warning("Chroma vector store initialization failed: %s", e)
 
+    # LLM Chains Initialization
     try:
-        # LLM Chain (Gemini)
-        llm = ChatGoogleGenerativeAI(model=config.GEMINI_MODEL, temperature=0.0)
-        SQL_PROMPT = """You are a strict SQL generator for an ARGO float PostgreSQL schema (tables: profiles, levels).
+        llm = ChatGoogleGenerativeAI(model=config.GEMINI_MODEL, temperature=0.0, google_api_key=config.GOOGLE_API_KEY)
+        
+        # 1. Chain for SQL Generation
+        SQL_PROMPT_TEXT = """You are a strict SQL generator for an ARGO float PostgreSQL schema (tables: profiles, levels).
 Rules:
 - Output only a single SELECT statement without a trailing semicolon.
 - Always qualify column names with their table name (e.g., profiles.juld, levels.temp_degc).
@@ -55,13 +59,28 @@ Context from schema: {context}
 User Question: {question}
 SQL Query:
 """
-        PROMPT = PromptTemplate(template=SQL_PROMPT, input_variables=["context", "question"])
-        llm_chain = LLMChain(llm=llm, prompt=PROMPT)
-        logger.info("LLM chain configured with model %s", config.GEMINI_MODEL)
+        SQL_PROMPT = PromptTemplate(template=SQL_PROMPT_TEXT, input_variables=["context", "question"])
+        llm_chain = LLMChain(llm=llm, prompt=SQL_PROMPT)
+        logger.info("LLM chain for SQL generation configured with model %s", config.GEMINI_MODEL)
+
+        # 2. Chain for generating polished natural language answers
+        ANSWER_PROMPT_TEXT = """You are FloatChat, an expert data analyst for ARGO floats.
+Instructions:
+- Produce a concise (1-2 sentence) answer to the user's question based on the data summary.
+- Do NOT repeat the SQL query or raw diagnostics. Use them only for context.
+- Suggest a single, relevant follow-up question.
+
+User question: {question}
+Data summary: {context}
+
+Answer:"""
+        ANSWER_PROMPT = PromptTemplate(template=ANSWER_PROMPT_TEXT, input_variables=["context", "question"])
+        answer_chain = LLMChain(llm=llm, prompt=ANSWER_PROMPT)
+        logger.info("LLM chain for answer generation configured with model %s", config.GEMINI_MODEL)
+
     except Exception as e:
-        logger.exception("LLM chain setup failed: %s", e)
-else:
-    logger.info("LLM or Vector retrieval not configured (Langchain/Google API key missing).")
+        logger.exception("LLM chain setup failed. This is likely due to an invalid GOOGLE_API_KEY or network issues: %s", e)
+
 
 def build_context_from_docs(docs: List[Any]) -> Tuple[str, List[Dict[str, Any]]]:
     """Builds a context string and a provenance list from retrieved documents."""

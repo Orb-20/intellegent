@@ -1,6 +1,6 @@
+# services/api/rag/response_generator.py
 import json
 import logging
-# --- THIS LINE IS CORRECTED ---
 from typing import Any, List, Dict, Optional, Tuple
 
 import pandas as pd
@@ -31,7 +31,6 @@ def compute_stats_and_plots(df: pd.DataFrame) -> Tuple[Dict[str, Any], List[Dict
         if numeric_cols:
             stats = df[numeric_cols].describe().round(3).to_dict()
 
-        # Timeseries plot for high-variance numeric columns if 'juld' exists
         if 'juld' in df.columns and numeric_cols:
             df['juld'] = pd.to_datetime(df['juld'], errors='coerce')
             var_cols = df[numeric_cols].var().nlargest(2).index.tolist()
@@ -44,7 +43,6 @@ def compute_stats_and_plots(df: pd.DataFrame) -> Tuple[Dict[str, Any], List[Dict
                         "y": sub[col].tolist(), "y_label": col
                     })
 
-        # Geo scatter plot if lat/lon exist
         if 'latitude' in df.columns and 'longitude' in df.columns:
             geo = df.dropna(subset=['latitude', 'longitude'])
             if not geo.empty:
@@ -63,29 +61,25 @@ def generate_polished_answer(question: str, df: Optional[pd.DataFrame], sql: str
     if df is None or df.empty:
         return "No results found for your query. You could try rephrasing or broadening the criteria."
 
+    # --- THIS IS THE FIX ---
+    # The entire block is updated for correctness and better logging.
     if llm_utils.LANGCHAIN_AVAILABLE and config.GOOGLE_API_KEY:
         try:
             stats, _ = compute_stats_and_plots(df)
             data_summary = f"Query returned {len(df)} rows."
-            if stats:
+            if not df.empty and len(df) < 5: # Include raw data for very small results
+                data_summary += f" Data: {df.to_json(orient='records')}"
+            elif stats:
                 data_summary += f" Key stats: {json.dumps(stats, default=str)}"
 
-            prompt = (
-                "You are FloatChat, an expert data analyst for ARGO floats.\n"
-                "Instructions:\n"
-                "- Produce a concise (1-2 sentence) answer to the user's question based on the data summary.\n"
-                "- Do NOT repeat the SQL query or raw diagnostics. Use them only for context.\n"
-                "- Suggest a single, relevant follow-up question.\n\n"
-                f"User question: {question}\n"
-                f"Data summary: {data_summary}\n\n"
-                "Answer:"
-            )
-            # This logic was referencing a non-existent llm_utils.ChatGoogleGenerativeAI, so I've corrected it.
-            if llm_utils.llm_chain:
-                 return llm_utils.llm_chain.run({"context": data_summary, "question": question})
+            # Use the dedicated answer_chain and log if it's not available
+            if llm_utils.answer_chain:
+                return llm_utils.answer_chain.run({"context": data_summary, "question": question})
+            else:
+                logger.warning("LLM answer_chain is not available. Using fallback response. Check API logs for initialization errors.")
 
         except Exception as e:
-            logger.exception("LLM polish failed: %s", e)
+            logger.exception("LLM polish step failed during execution: %s", e)
             
     # Fallback response
     return f"The query returned {len(df)} rows. You can ask to visualize these results or request aggregates (max/min/avg)."

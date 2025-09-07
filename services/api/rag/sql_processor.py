@@ -1,4 +1,5 @@
 # services/api/rag/sql_processor.py
+
 import re
 from typing import List, Tuple, Dict, Set
 
@@ -18,16 +19,13 @@ def qualify_and_validate(sql: str) -> Tuple[str, Dict[str, str], List[str]]:
     for ident in sorted(identifiers, key=len, reverse=True):
         base = ident.split('.')[-1]
         
-        # Skip SQL keywords, known tables, and safe identifiers
         if base.upper() in config.SQL_KEYWORDS_AND_FUNCTIONS or base in config.SAFE_IDENTIFIERS or base in db_utils.introspect_schema():
             continue
         
-        # Apply synonyms
         canon = config.SYNONYMS.get(base.lower(), base)
         if canon != base:
             mapping[ident] = canon
 
-        # Qualify column if not already qualified
         if canon in config.CANONICAL_COLUMNS and '.' not in ident:
             table = config.CANONICAL_COLUMNS[canon]
             qualified_sql = re.sub(rf"\b{re.escape(ident)}\b", f"{table}.{canon}", qualified_sql)
@@ -37,19 +35,42 @@ def qualify_and_validate(sql: str) -> Tuple[str, Dict[str, str], List[str]]:
 
     return qualified_sql, mapping, sorted(list(unknown))
 
+# --- THIS IS THE CORRECTED FUNCTION ---
 def inject_join_if_needed(sql: str) -> Tuple[str, bool]:
-    """Adds a JOIN to the 'levels' table if measurement variables are used without a join."""
+    """
+    Adds a JOIN to the 'levels' table if its columns are mentioned but the
+    table itself is not present in the FROM or JOIN clauses.
+    """
     sql_lower = sql.lower()
-    needs_join = any(f"levels.{col}" in sql_lower for col in ["temp_degc", "psal_psu", "pres_dbar", "level_index"])
-    
-    if needs_join and "join levels" not in sql_lower:
-        if re.search(r"(?i)\bFROM\s+profiles\b", sql):
-            sql = re.sub(r"(?i)\bFROM\s+profiles\b", "FROM profiles JOIN levels ON profiles.profile_id = levels.profile_id", sql, count=1)
-            return sql, True
-        else: # Fallback for more complex FROM clauses
-            sql = re.sub(r"(?i)\bFROM\s+([a-zA-Z0-9_\.]+)", lambda m: f"FROM {m.group(1)} JOIN levels ON {m.group(1)}.profile_id = levels.profile_id", sql, count=1)
-            return sql, True
+
+    # 1. Check if any column requires the 'levels' table.
+    # These column names are unique enough to the 'levels' table.
+    needs_levels_table = any(col in sql_lower for col in ['temp_degc', 'psal_psu', 'pres_dbar'])
+
+    if not needs_levels_table:
+        return sql, False # No join needed, exit early.
+
+    # 2. Check if the 'levels' table is already included in the query.
+    # This regex looks for 'FROM levels' or 'JOIN levels' as whole words.
+    if re.search(r"\b(from|join)\s+levels\b", sql_lower):
+        return sql, False # Table already present, no join needed.
+
+    # 3. If a join is needed and not present, inject it after 'FROM profiles'.
+    # This is the safest assumption for where to add the join.
+    if "from profiles" in sql_lower:
+        # Robustly find 'FROM profiles' and add the JOIN right after it.
+        # This handles cases where 'profiles' might have an alias (e.g., "FROM profiles p").
+        sql_with_join = re.sub(
+            r"(?i)\bfrom\s+profiles\b(?!\.)",
+            "FROM profiles JOIN levels ON profiles.profile_id = levels.profile_id",
+            sql,
+            count=1
+        )
+        return sql_with_join, True
+
+    # 4. If we can't find 'FROM profiles', don't risk an unsafe modification.
     return sql, False
+
 
 def clamp_date_range(sql: str) -> Tuple[str, str]:
     """Clamps the date range in the query to the available data range in the DB."""
@@ -82,7 +103,6 @@ def inject_missing_filters(sql: str) -> str:
             if " where " in q.lower():
                 q = re.sub(r"(?i)\bWHERE\b", f"WHERE {filter_cond} AND ", q, count=1)
             else:
-                # Find a place to insert WHERE (e.g., before GROUP BY, ORDER BY, LIMIT)
                 insertion_point = re.search(r"\b(GROUP BY|ORDER BY|LIMIT)\b", q, re.IGNORECASE)
                 if insertion_point:
                     idx = insertion_point.start()
