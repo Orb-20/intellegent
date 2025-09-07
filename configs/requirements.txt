@@ -1,0 +1,17 @@
+pandas
+numpy
+netCDF4
+xarray
+psycopg2-binary
+sqlalchemy
+fastapi
+uvicorn[standard]
+python-dotenv
+requests
+chromadb
+langchain
+langchain-community
+langchain-google-genai
+google-generativeai
+streamlit
+plotly

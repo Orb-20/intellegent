@@ -1,0 +1,81 @@
+services:
+  db:
+    image: postgis/postgis:13-3.1
+    container_name: postgres_db
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-agro}
+      POSTGRES_USER: ${POSTGRES_USER:-agro}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agro}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../db/schema.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - floatchat-net
+
+  chroma:
+    image: chromadb/chroma:latest
+    container_name: chroma_db
+    restart: always
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/chroma/.chroma/index
+    networks:
+      - floatchat-net
+
+  api:
+    build:
+      context: ..
+      dockerfile: configs/Dockerfile.api
+    container_name: floatchat_api
+    depends_on:
+      - db
+      - chroma
+    restart: always
+    ports:
+      - "8001:8000"
+    env_file:
+      - ../.env # This tells Docker to load variables from your .env file
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-agro}
+      POSTGRES_USER: ${POSTGRES_USER:-agro}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agro}
+      CHROMA_HOST: chroma
+      CHROMA_PORT: 8000
+      # GOOGLE_API_KEY is now loaded securely from .env
+    networks:
+      floatchat-net:
+        aliases:
+          - api
+    # --- THIS IS THE CORRECTED COMMAND ---
+    command: uvicorn services.api.main:app --host 0.0.0.0 --port 8000 --reload
+
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: configs/Dockerfile.frontend
+    container_name: floatchat_frontend
+    depends_on:
+      - api
+    restart: always
+    ports:
+      - "8501:8501"
+    environment:
+        API_URL: http://api:8000 # Make sure frontend knows where the API is
+    networks:
+      - floatchat-net
+    command: ["streamlit", "run", "services/frontend/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+
+volumes:
+  postgres_data:
+  chroma_data:
+
+networks:
+  floatchat-net:
+    driver: bridge
