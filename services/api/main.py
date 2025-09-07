@@ -7,9 +7,8 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import text, exc
 
-# Import modularized components
 from .rag import (
     config,
     db_utils,
@@ -20,12 +19,11 @@ from .rag import (
     followup_handler
 )
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FloatChat API")
 
-# --- Pydantic Models ---
 class QueryRequest(BaseModel):
     question: str
     conversation_id: Optional[str] = None
@@ -41,87 +39,107 @@ class QueryResponse(BaseModel):
     conversation_id: str
     error: Optional[str] = None
 
-# --- Main Endpoint ---
 @app.post("/query", response_model=QueryResponse)
 async def query(req: QueryRequest):
     question = (req.question or "").strip()
     conv_id = req.conversation_id or str(uuid4())
     diagnostics: List[str] = []
+    provenance: List[Dict] = []
 
     if not question:
         raise HTTPException(status_code=400, detail="Question is required.")
     if not db_utils.engine:
         raise HTTPException(status_code=503, detail="Database engine not configured.")
 
-    # 1. Handle potential follow-up
-    followup_result = followup_handler.handle_followup_request(conv_id, question)
-    if followup_result:
-        sql = followup_result['sql']
-        diagnostics.append("Generated from follow-up conversation.")
-    else:
-        # 2. Generate new SQL if not a follow-up
-        context, provenance = "", []
-        if llm_utils.retriever:
-            try:
+    try:
+        # 0. Classify Intent
+        intent = "data_query"
+        if llm_utils.intent_chain:
+            intent = llm_utils.intent_chain.run({"question": question}).strip().lower()
+        diagnostics.append(f"Classified intent: {intent}")
+
+        if intent == "greeting":
+            return QueryResponse(natural_language_response="Hello! How can I help you with ARGO data today?", conversation_id=conv_id)
+        if intent != "data_query":
+            return QueryResponse(natural_language_response="I specialize in ARGO data. Please ask me about temperature, salinity, or float locations.", conversation_id=conv_id)
+
+        # 1. Handle Follow-up or Generate New SQL
+        sql = ""
+        followup_result = followup_handler.handle_followup_request(conv_id, question)
+        if followup_result:
+            sql = followup_result['sql']
+            diagnostics.append("Generated from follow-up conversation.")
+        else:
+            context = ""
+            if llm_utils.retriever:
                 docs = llm_utils.retriever.get_relevant_documents(question)
                 context, provenance = llm_utils.build_context_from_docs(docs)
-            except Exception as e:
-                logger.warning("Retriever error: %s", e)
+                if provenance:
+                    diagnostics.append(f"Retrieved {len(provenance)} knowledge documents.")
+            
+            sql = sql_generator.try_generate_sql_with_llm(context, question)
+            if not sql:
+                diagnostics.append("LLM SQL generation failed. Falling back to rule-based.")
+                sql, diag = sql_generator.rule_based_translator(question, db_utils.introspect_schema())
+                diagnostics.extend(diag)
 
-        sql = sql_generator.try_generate_sql_with_llm(context, question)
         if not sql:
-            sql, diag = sql_generator.rule_based_translator(question, db_utils.introspect_schema())
-            diagnostics.extend(diag)
+            return QueryResponse(natural_language_response="I could not translate your question to a query. Please try rephrasing.", conversation_id=conv_id, error="sql_generation_failed")
 
-    if not sql:
-        return QueryResponse(natural_language_response="Could not generate SQL for your question.", conversation_id=conv_id, error="sql_generation_failed")
+        # 2. Process, Refine, and Validate SQL
+        processed_sql, process_diagnostics = sql_processor.process_and_refine_sql(sql)
+        diagnostics.extend(process_diagnostics)
 
-    # 3. Process and refine SQL
-    sql_q, mapping, unknown = sql_processor.qualify_and_validate(sql)
-    if mapping: diagnostics.append(f"Applied mappings: {mapping}")
-    if unknown: diagnostics.append(f"Unrecognized identifiers: {unknown}")
+        # 3. Execute SQL with Self-Correction
+        df, current_sql = None, processed_sql
+        for attempt in range(2):
+            try:
+                with db_utils.engine.connect() as conn:
+                    df = pd.read_sql(text(current_sql), conn)
+                diagnostics.append(f"SQL executed successfully on attempt {attempt + 1}.")
+                break
+            except exc.SQLAlchemyError as e:
+                error_str = str(e.orig) if hasattr(e, 'orig') else str(e)
+                diagnostics.append(f"SQL attempt {attempt + 1} failed: {error_str}")
+                if attempt < 1 and llm_utils.correction_chain:
+                    schema_str = "\n".join(db_utils.get_schema_string().values())
+                    corrected_sql = llm_utils.correction_chain.run({"schema": schema_str, "question": question, "sql_query": current_sql, "error_message": error_str})
+                    current_sql, correction_diags = sql_processor.process_and_refine_sql(corrected_sql)
+                    diagnostics.extend(correction_diags)
+                    diagnostics.append("SQL was self-corrected.")
+                else:
+                    raise e
 
-    sql_q, joined = sql_processor.inject_join_if_needed(sql_q)
-    if joined: diagnostics.append("Auto-joined to 'levels' table.")
+        if df is None: # Should only happen if loop breaks but df is not assigned
+             return QueryResponse(natural_language_response="Query executed but failed to produce a result.", sql_query=current_sql, conversation_id=conv_id)
 
-    sql_q, clamped_diag = sql_processor.clamp_date_range(sql_q)
-    if clamped_diag: diagnostics.append(clamped_diag)
+        # 4. Generate Final Response (NL + Visualizations) using the Unified Engine
+        nl_response, plots = response_generator.generate_final_response(question, df, current_sql, provenance, diagnostics)
+        
+        follow_options = followup_handler.build_followup_options(current_sql, question, df)
+        followup_handler.store_followups(conv_id, current_sql, follow_options)
 
-    filtered_sql = sql_processor.inject_missing_filters(sql_q)
-    if not config.is_safe_select(filtered_sql):
-        return QueryResponse(natural_language_response="Generated SQL failed safety checks.", sql_query=filtered_sql, conversation_id=conv_id, error="safety_failed")
+        return QueryResponse(
+            natural_language_response=nl_response,
+            sql_query=current_sql,
+            data=response_generator.df_to_json_rows(df.head(100)),
+            plots=plots,
+            diagnostics=diagnostics,
+            provenance=provenance,
+            follow_ups=follow_options,
+            conversation_id=conv_id
+        )
 
-    # 4. Execute SQL
-    try:
-        with db_utils.engine.connect() as conn:
-            df = pd.read_sql(text(filtered_sql), conn)
     except Exception as e:
-        logger.exception("SQL execution failed: %s", e)
-        return QueryResponse(natural_language_response=f"Error executing query: {e}", sql_query=filtered_sql, conversation_id=conv_id, error=str(e), diagnostics=diagnostics)
-
-    # 5. Generate Response
-    stats, plots = response_generator.compute_stats_and_plots(df)
-    final_plots = response_generator.deduplicate_plots(plots)
-
-    nl_response = followup_result.get('nl_response') if followup_result else response_generator.generate_polished_answer(question, df, filtered_sql, [], diagnostics)
-    
-    follow_options = followup_handler.build_followup_options(filtered_sql, question, df)
-    followup_handler.store_followups(conv_id, filtered_sql, follow_options)
-
-    return QueryResponse(
-        natural_language_response=nl_response,
-        sql_query=filtered_sql,
-        data=response_generator.df_to_json_rows(df),
-        plots=final_plots,
-        diagnostics=diagnostics,
-        follow_ups=follow_options,
-        conversation_id=conv_id
-    )
+        logger.exception("An unhandled error occurred in /query endpoint: %s", e)
+        return QueryResponse(
+            natural_language_response=f"I encountered an unexpected server error. Please try your question again.",
+            conversation_id=conv_id,
+            error=str(e)
+        )
 
 @app.get("/health")
 def health():
-    if not db_utils.engine:
-        return {"status": "error", "message": "Database not configured."}
     try:
         with db_utils.engine.connect() as conn:
             conn.execute(text("SELECT 1"))

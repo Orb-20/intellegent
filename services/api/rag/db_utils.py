@@ -30,6 +30,26 @@ def introspect_schema() -> Dict[str, List[str]]:
         logger.warning("Schema introspection failed: %s", e)
     return schema
 
+# --- THIS IS THE NEW FUNCTION ---
+def get_schema_string() -> Dict[str, str]:
+    """
+    Returns a dictionary of table names to their CREATE TABLE like string representation.
+    This is useful for providing schema context to the LLM.
+    """
+    schema_strings: Dict[str, str] = {}
+    if not engine:
+        return schema_strings
+    try:
+        inspector = inspect(engine)
+        for table_name in inspector.get_table_names():
+            columns = inspector.get_columns(table_name)
+            col_defs = [f"{c['name']} {c['type']}" for c in columns]
+            schema_strings[table_name] = f"Table {table_name}({', '.join(col_defs)})"
+    except Exception as e:
+        logger.warning("get_schema_string failed: %s", e)
+    return schema_strings
+
+
 def get_juld_range() -> Tuple[Optional[str], Optional[str]]:
     """Gets the min and max 'juld' timestamps from the profiles table."""
     if not engine:
