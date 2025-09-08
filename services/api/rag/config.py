@@ -5,6 +5,7 @@ from typing import Dict, Set
 
 # --- Environment Configuration ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 DB_USER = os.getenv("POSTGRES_USER", "agro")
 DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "password")
 DB_NAME = os.getenv("POSTGRES_DB", "agro")
@@ -17,6 +18,7 @@ CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
 CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "floatchat")
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-large-latest")
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "200"))
 MISSING_THRESHOLD = 9000
 FILL_VALUE = int(os.getenv("FILL_VALUE", "99999"))

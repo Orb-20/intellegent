@@ -11,6 +11,7 @@ requests
 chromadb
 langchain
 langchain-community
+langchain-mistralai
 langchain-google-genai
 google-generativeai
 streamlit
